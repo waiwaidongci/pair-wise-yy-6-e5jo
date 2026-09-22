@@ -1,214 +1,310 @@
+// HTTP 接线层：路由与入参校验；规则在 rules.js，存档在 store.js，页面在 page.js。
+
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { page } from "./src/page.js";
+import { Archive, dbPath, findItem, findBatch, findRecord, addHistory } from "./src/store.js";
+import {
+  STATE,
+  ITEM_STATUS,
+  FIELD_LABELS,
+  KEY_FIELDS,
+  missingFields,
+  evaluateRelease,
+  releaseView,
+  deriveItemStatus,
+} from "./src/rules.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "ink-stick-testing.json");
 const port = Number(process.env.PORT || 3037);
-const seed = {
-  "items": [
-    {
-      "code": "IS-001",
-      "smokeSource": "黄山松烟",
-      "glueRatio": "7.5%",
-      "ageYears": 8,
-      "storage": "恒湿柜B",
-      "status": "已试磨",
-      "logs": [
-        {
-          "at": "2026-06-11",
-          "step": "试磨",
-          "note": "宣纸20滴水，出墨快，评分86",
-          "score": 86
-        }
-      ]
-    },
-    {
-      "code": "IS-002",
-      "smokeSource": "桐油烟",
-      "glueRatio": "8%",
-      "ageYears": 3,
-      "storage": "试样盒C",
-      "status": "待试磨",
-      "logs": []
-    }
-  ]
-};
-const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-const stages = ["待试磨","已试磨","重点观察"];
-const statLabels = ["待试磨","已试磨","重点观察"];
-const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
+const archive = new Archive(process.env.DATA_PATH || dbPath);
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
-  }
-  return JSON.parse(await readFile(dbPath, "utf8"));
-}
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+  if (!chunks.length) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new HttpError(400, "invalid_json");
+  }
 }
+
+class HttpError extends Error {
+  constructor(status, error) {
+    super(error);
+    this.status = status;
+  }
+}
+
 function send(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(data, null, 2));
 }
-function html(res, text) {
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-  res.end(text);
+
+function newId(prefix) {
+  return prefix + "-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 7);
 }
-function newId() { return "IS-" + Date.now(); }
-function computeStats(items) {
-  const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
-  for (const item of items) {
-    if (stats[item.status] !== undefined) stats[item.status] += 1;
+
+function trim(v) {
+  return typeof v === "string" ? v.trim() : v;
+}
+
+// 解析前端 datetime-local（无时区）或 ISO 时间；默认当前时间
+function parseAt(value) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return new Date().toISOString();
   }
-  return stats;
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) throw new HttpError(400, "invalid_at");
+  return d.toISOString();
 }
-function summarize(item) {
-  const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
-}
-function page() {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>墨锭试磨室</title>
-  <style>
-    :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
-    header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
-    form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
-  </style>
-</head>
-<body>
-  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><button id="reload">刷新</button></header>
-  <main>
-    <section>
-      <form id="createForm"><h2>新增墨锭</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存墨锭</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>创建试磨记录</h2><label>选择墨锭</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
-    </section>
-    <section>
-      <div class="stats" id="stats"></div>
-      <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
-      <div class="panel"><h2>选择墨锭后录入试磨记录，系统会保留多次试磨结果并更新评分状态。</h2><div class="grid" id="cards"></div></div>
-    </section>
-  </main>
-  <script>
-    const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-    const stages = ["待试磨","已试磨","重点观察"];
-    const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
-    const createForm = document.querySelector('#createForm');
-    const actionForm = document.querySelector('#actionForm');
-    const cards = document.querySelector('#cards');
-    const statsEl = document.querySelector('#stats');
-    const itemSelect = document.querySelector('#itemSelect');
-    let items = [];
-    async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '请求失败');
-      return data;
-    }
-    function renderForms() {
-      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
-      document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
-    }
-    function render() {
-      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
-      const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
-      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
-      const status = document.querySelector('#statusFilter').value;
-      const q = document.querySelector('#search').value.trim();
-      const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
-      cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
-      document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
-    }
-    function cardHtml(item) {
-      const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
-      const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
-    }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
-    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
-    renderForms(); load();
-  </script>
-</body>
-</html>`;
+
+// 状态列表：所有状态由规则层推算，列表 / 履历 / 刷新共用同一结果
+function stateView(db) {
+  const items = db.items.map((item) => {
+    const status = deriveItemStatus(item.batches || []);
+    return {
+      id: item.id,
+      code: item.code,
+      smokeSource: item.smokeSource,
+      glueRatio: item.glueRatio,
+      ageYears: item.ageYears,
+      storage: item.storage,
+      status,
+      legacyLogs: item.legacyLogs || [],
+      batches: (item.batches || []).map((b) => ({
+        id: b.id,
+        batchNo: b.batchNo,
+        openedAt: b.openedAt,
+        endedAt: b.endedAt || null,
+        state: b.state,
+        records: b.records,
+        history: b.history,
+        release: b.state === STATE.OPEN ? releaseView(b.records) : null,
+      })),
+    };
+  });
+  const stats = Object.fromEntries(ITEM_STATUS.map((s) => [s, 0]));
+  for (const item of items) stats[item.status] += 1;
+  return { items, stats };
 }
 
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
-    if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+    const db = await archive.load();
+
+    if (req.method === "GET" && url.pathname === "/") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(page());
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/state") {
+      return send(res, 200, stateView(db));
+    }
+
+    // 墨锭建档
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建墨锭" }] };
-      
+      const code = trim(input.code);
+      if (!code) throw new HttpError(400, "code_required");
+      if (db.items.some((x) => x.code === code)) throw new HttpError(409, "code_exists");
+      const item = {
+        id: newId("item"),
+        code,
+        smokeSource: trim(input.smokeSource) || "",
+        glueRatio: trim(input.glueRatio) || "",
+        ageYears: input.ageYears === "" || input.ageYears === undefined ? null : Number(input.ageYears),
+        storage: trim(input.storage) || "",
+        batches: [],
+      };
       db.items.unshift(item);
-      await saveDb(db);
-      return send(res, 201, item);
+      await archive.save();
+      return send(res, 201, stateView(db).items.find((x) => x.id === item.id));
     }
-    const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
-    if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
-      return send(res, 200, item);
+
+    // 开启新批次：同一墨锭存在未结束批次时拒绝
+    const openMatch = url.pathname.match(/^\/api\/items\/([^/]+)\/batches$/);
+    if (openMatch && req.method === "POST") {
+      await body(req);
+      const item = findItem(db, decodeURIComponent(openMatch[1]));
+      if (!item) throw new HttpError(404, "item_not_found");
+      const open = (item.batches || []).find((b) => b.state === STATE.OPEN);
+      if (open) throw new HttpError(409, "open_batch_exists:" + open.batchNo);
+      item.batches ||= [];
+      const batch = {
+        id: newId("batch"),
+        batchNo: archive.nextBatchNo(),
+        openedAt: new Date().toISOString(),
+        endedAt: null,
+        state: STATE.OPEN,
+        records: [],
+        history: [],
+      };
+      addHistory(batch, "open", "开启批次 #" + batch.batchNo);
+      item.batches.push(batch);
+      await archive.save();
+      return send(res, 201, stateView(db).items.find((x) => x.id === item.id));
     }
-    const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
-    if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
+
+    // 登记试磨结果
+    const recordMatch = url.pathname.match(
+      /^\/api\/items\/([^/]+)\/batches\/([^/]+)\/records$/
+    );
+    if (recordMatch && req.method === "POST") {
       const input = await body(req);
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
-      return send(res, 201, item);
+      const item = findItem(db, decodeURIComponent(recordMatch[1]));
+      if (!item) throw new HttpError(404, "item_not_found");
+      const batch = findBatch(item, decodeURIComponent(recordMatch[2]));
+      if (!batch) throw new HttpError(404, "batch_not_found");
+      if (batch.state !== STATE.OPEN) throw new HttpError(409, "batch_not_open");
+
+      const at = parseAt(input.at);
+      const missing = missingFields(input);
+
+      // 缺项：该批次作废且不占号；登记内容（原样）留档
+      if (missing.length) {
+        const record = {
+          id: newId("rec"),
+          at,
+          grinder: trim(input.grinder) || "",
+          mouth: trim(input.mouth) || "",
+          water: trim(input.water) || "",
+          paper: trim(input.paper) || "",
+          temp: trim(input.temp) || "",
+          humidity: trim(input.humidity) || "",
+          score: missing.includes("评分") ? null : Number(input.score),
+          incomplete: true,
+          missing,
+        };
+        batch.records.push(record);
+        addHistory(
+          batch,
+          "record",
+          "缺项登记（缺：" + missing.join("、") + "），记录留档",
+          { recordId: record.id }
+        );
+        batch.state = STATE.VOID;
+        batch.endedAt = at;
+        addHistory(
+          batch,
+          "void",
+          "登记缺项（" + missing.join("、") + "），批次作废且不占号；号码 #" + batch.batchNo + " 回收"
+        );
+        archive.releaseBatchNo(batch.batchNo);
+        batch.batchNo = null;
+        await archive.save();
+        return send(res, 201, {
+          voided: true,
+          missing,
+          item: stateView(db).items.find((x) => x.id === item.id),
+        });
+      }
+
+      const score = Number(input.score);
+      const record = {
+        id: newId("rec"),
+        at,
+        grinder: trim(input.grinder),
+        mouth: trim(input.mouth),
+        water: trim(input.water),
+        paper: trim(input.paper),
+        temp: trim(input.temp),
+        humidity: trim(input.humidity),
+        score,
+      };
+      batch.records.push(record);
+      addHistory(
+        batch,
+        "record",
+        `${record.grinder} 登记结果 ${score} 分${score >= 85 ? "（高分）" : "（低分，连续高分计数重置）"}`,
+        { recordId: record.id }
+      );
+
+      // 自动放行判定：连续两次高分 + 换人 + 隔 4 小时
+      const result = evaluateRelease(batch.records);
+      if (result.releasable) {
+        batch.state = STATE.RELEASED;
+        batch.endedAt = at;
+        const [a, b] = result.pair;
+        addHistory(
+          batch,
+          "release",
+          `两次高分（${a.grinder} ${a.score} 分 / ${b.grinder} ${b.score} 分）、换人且间隔满 4 小时，自动放行`
+        );
+      }
+      await archive.save();
+      return send(res, 201, {
+        voided: false,
+        release: releaseView(batch.records),
+        released: result.releasable,
+        item: stateView(db).items.find((x) => x.id === item.id),
+      });
     }
-    const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
-    if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
+
+    // 更正关键字段：已放行批次因此失效；旧值留档
+    const correctMatch = url.pathname.match(
+      /^\/api\/items\/([^/]+)\/batches\/([^/]+)\/records\/([^/]+)$/
+    );
+    if (correctMatch && req.method === "PATCH") {
       const input = await body(req);
-      item.logs ||= [];
-      const score = Number(input.score || 0);
-      item.tests ||= [];
-      item.tests.push({ at: new Date().toISOString(), ...input, score });
-      item.status = score >= 85 ? "已试磨" : "重点观察";
-      item.logs.push({ at: new Date().toISOString(), step: "试磨", note: (input.paper || "试纸") + "，评分" + score, score });
-      await saveDb(db);
-      return send(res, 201, item);
+      const item = findItem(db, decodeURIComponent(correctMatch[1]));
+      if (!item) throw new HttpError(404, "item_not_found");
+      const batch = findBatch(item, decodeURIComponent(correctMatch[2]));
+      if (!batch) throw new HttpError(404, "batch_not_found");
+      const record = findRecord(batch, decodeURIComponent(correctMatch[3]));
+      if (!record) throw new HttpError(404, "record_not_found");
+
+      const reason = trim(input.reason);
+      if (!reason) throw new HttpError(400, "reason_required");
+
+      const changes = [];
+      for (const [key, label] of KEY_FIELDS) {
+        if (input[key] === undefined || input[key] === null || String(input[key]).trim() === "") {
+          continue; // 未填的字段保持原值，不允许通过更正清空关键字段
+        }
+        let next = trim(input[key]);
+        if (key === "score") {
+          next = Number(next);
+          if (!Number.isFinite(next)) throw new HttpError(400, "invalid_score");
+        }
+        if (String(record[key]) !== String(next)) {
+          changes.push({ key, label, from: record[key], to: next });
+          record[key] = next;
+        }
+      }
+      if (!changes.length) throw new HttpError(400, "no_changes");
+
+      const detail = changes
+        .map((c) => `${c.label}：「${c.from}」→「${c.to}」`)
+        .join("；");
+      addHistory(batch, "correct", `更正结果 ${record.grinder} ${record.at}：${detail}（原因：${reason}）`, {
+        recordId: record.id,
+        changes,
+        reason,
+      });
+
+      let invalidated = false;
+      if (batch.state === STATE.RELEASED) {
+        batch.state = STATE.INVALID;
+        batch.endedAt = new Date().toISOString();
+        invalidated = true;
+        addHistory(batch, "invalidate", "关键字段更正，已通过批次失效，须重开批次重新放行");
+      }
+      await archive.save();
+      return send(res, 200, {
+        invalidated,
+        changes,
+        item: stateView(db).items.find((x) => x.id === item.id),
+      });
     }
-    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
-    send(res, 404, { error: "not_found" });
+
+    return send(res, 404, { error: "not_found" });
   } catch (error) {
-    send(res, 500, { error: error.message });
+    const status = error instanceof HttpError ? error.status : 500;
+    send(res, status, { error: status === 500 ? error.message : error.message });
   }
 });
-server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));
+
+server.listen(port, () =>
+  console.log("墨锭试磨室 · 试磨批次与放行台 listening on http://localhost:" + port)
+);
